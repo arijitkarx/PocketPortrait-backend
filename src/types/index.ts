@@ -1,4 +1,5 @@
 import { Request } from 'express';
+import { ParsedQs } from 'qs';
 
 export interface AuthenticatedUser {
   id: string;
@@ -49,8 +50,9 @@ export interface AuthResponse {
   };
 }
 
-export interface AuthRequest extends Request {
+export interface AuthRequest extends Request<Record<string, any>, any, any, ParsedQs> {
   user?: AuthenticatedUser;
+  cookies: { [key: string]: any };
 }
 
 // export interface DashboardStats {
