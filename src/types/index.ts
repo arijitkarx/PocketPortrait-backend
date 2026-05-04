@@ -1,5 +1,4 @@
-import { Request } from 'express';
-import { ParsedQs } from 'qs';
+import type { Request as ExpressRequest } from 'express-serve-static-core';
 
 export interface AuthenticatedUser {
   id: string;
@@ -50,7 +49,7 @@ export interface AuthResponse {
   };
 }
 
-export interface AuthRequest extends Request<Record<string, any>, any, any, ParsedQs> {
+export interface AuthRequest extends ExpressRequest {
   user?: AuthenticatedUser;
   cookies: { [key: string]: any };
 }
