@@ -1,164 +1,195 @@
 import express, { Request, Response } from 'express';
-import jwt from 'jsonwebtoken';
-import User from '../models/User';
+import { authSupabase, pool } from '../config/postgres';
+import { authenticateToken } from '../middleware/auth';
 import { AuthRequest, AuthResponse } from '../types';
 
 const router = express.Router();
 
-// Register
-router.post('/register', async (req: Request<{}, AuthResponse, AuthRequest>, res: Response<AuthResponse>): Promise<void> => {
-  try {
-    const { email, username, password } = req.body;
-
-    // Check if user exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      res.status(400).json({ message: 'User already exists' } as any);
-      return;
-    }
-
-    // Create user
-    const user = new User({ email, username, password });
-    await user.save();
-
-    const token = jwt.sign(
-      { userId: user._id, email: user.email },
-      process.env.JWT_SECRET || 'fallback-secret',
-      {
-        expiresIn: process.env.JWT_EXPIRES_IN || '7d'
-      } as jwt.SignOptions
-    );
-        // Set JWT in httpOnly cookie with proper settings
-    res.cookie('authToken', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production', // Only secure in production
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // Changed from 'strict' for better compatibility
-      path: '/',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days to match JWT expiration
-        domain: '.arijitkar.com',  // 👈 KEY: Allow cookie for all subdomains
-    });
-    res.cookie('isLoggedIn', 'true', {
-  httpOnly: false, // Middleware and JS can see this
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'none',
-  domain: '.arijitkar.com',  // 👈 KEY: Allow cookie for all subdomains
-  maxAge: 7 * 24 * 60 * 60 * 1000
-});
-
-    res.status(201).json({
-      token,
-      user: {
-        id: user._id.toString(),
-        email: user.email,
-        username: user.username
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ message: error.message } as any);
-  }
-});
-
-// Login
-router.post('/login', async (req: Request<{}, AuthResponse, AuthRequest>, res: Response): Promise<void> => {
-  try {
-    const { email, password } = req.body;
-
-    // Find user
-    const user = await User.findOne({ email });
-    if (!user) {
-      res.status(401).json({ message: 'Invalid credentials' });
-      return;
-    }
-
-    // Check password
-    const isMatch = await (user as any).comparePassword(password);
-    if (!isMatch) {
-      res.status(401).json({ message: 'Invalid credentials' });
-      return;
-    }
-
- 
-  
-    const token = jwt.sign(
-      { userId: user._id, email: user.email },
-      process.env.JWT_SECRET || 'fallback-secret',
-      {
-        expiresIn: process.env.JWT_EXPIRES_IN || '7d'
-      } as jwt.SignOptions
-    );
-    // Set JWT in httpOnly cookie with proper settings
-    res.cookie('authToken', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production', // Only secure in production
-      sameSite: 'none', // Changed from 'strict' for better compatibility
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days to match JWT expiration
-      path: '/', // Ensure cookie is accessible across the app
-        domain: '.arijitkar.com',  // 👈 KEY: Allow cookie for all subdomains
-    });
-    res.cookie('isLoggedIn', 'true', {
-  httpOnly: false, // Middleware and JS can see this
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'none',
-  maxAge: 7 * 24 * 60 * 60 * 1000,
-    domain: '.arijitkar.com',  // 👈 KEY: Allow cookie for all subdomains
-});
-
-    res.json({
-      user: {
-        id: user._id.toString(),
-        email: user.email,
-        username: user.username
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-
-router.post('/logout', (req: Request, res: Response): void => {
-  res.clearCookie('authToken', {
+const cookieOptions = {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'none',
-    path: '/', // Ensure cookie is cleared across the app
-    domain: '.arijitkar.com'  // 👈 KEY: Allow cookie for all subdomains
-  });
-res.clearCookie('isLoggedIn', {
-    httpOnly: false, // Allow JS to clear this cookie
+    sameSite: process.env.NODE_ENV === 'production' ? ('none' as const) : ('lax' as const),
+    path: '/',
+    domain: process.env.COOKIE_DOMAIN || undefined
+};
+
+const publicCookieOptions = {
+    httpOnly: false,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'none',
-    domain: '.arijitkar.com',  // 👈 KEY: Allow cookie for all subdomains
-    path: '/' // Ensure cookie is cleared across the app
-  });
-  res.json({ message: 'Logged out successfully' });
+    sameSite: process.env.NODE_ENV === 'production' ? ('none' as const) : ('lax' as const),
+    path: '/',
+    domain: process.env.COOKIE_DOMAIN || undefined
+};
+
+const saveProfile = async (userId: string, email: string, username?: string): Promise<void> => {
+    await pool.query(
+        `
+      INSERT INTO profiles (id, email, username, updated_at)
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+      ON CONFLICT (id)
+      DO UPDATE SET
+        email = EXCLUDED.email,
+        username = COALESCE(EXCLUDED.username, profiles.username),
+        updated_at = CURRENT_TIMESTAMP
+    `,
+        [userId, email, username || null]
+    );
+};
+
+const setAuthCookies = (res: Response, token: string, refreshToken?: string): void => {
+    res.cookie('authToken', token, cookieOptions);
+    if (refreshToken) {
+        res.cookie('refreshToken', refreshToken, cookieOptions);
+    }
+    res.cookie('isLoggedIn', 'true', publicCookieOptions);
+};
+
+router.post('/register', async (req: Request, res: Response<AuthResponse>): Promise<void> => {
+    try {
+        const { email, username, password } = (req.body || {}) as {
+            email?: string;
+            username?: string;
+            password?: string;
+        };
+
+        if (!email || !password) {
+            res.status(400).json({ message: 'Email and password are required' } as any);
+            return;
+        }
+
+        const { data, error } = await authSupabase.auth.signUp({
+            email,
+            password,
+            options: {
+                data: {
+                    username: username || ''
+                }
+            }
+        });
+
+        if (error || !data.user) {
+            res.status(400).json({ message: error?.message || 'Failed to register user' } as any);
+            return;
+        }
+
+        await saveProfile(data.user.id, data.user.email || email, username);
+
+        if (data.session) {
+            setAuthCookies(res, data.session.access_token, data.session.refresh_token);
+        }
+
+        res.status(201).json({
+            token: data.session?.access_token || '',
+            refreshToken: data.session?.refresh_token,
+            user: {
+                id: data.user.id,
+                email: data.user.email || email,
+                username: username || (data.user.user_metadata as any)?.username || ''
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ message: error.message } as any);
+    }
 });
 
-router.get('/me', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const token = req.cookies.authToken;
-    if (!token) {
-      res.status(401).json({ message: 'Unauthorized' });
-      return;
-    }
+router.post('/login', async (req: Request, res: Response<AuthResponse>): Promise<void> => {
+    try {
+        const { email, password } = (req.body || {}) as {
+            email?: string;
+            password?: string;
+        };
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret') as jwt.JwtPayload;
-    const user = await User.findById(decoded.userId);
-    if (!user) {
-      res.status(404).json({ message: 'User not found' });
-      return;
-    }
+        if (!email || !password) {
+            res.status(400).json({ message: 'Email and password are required' } as any);
+            return;
+        }
 
-    res.json({
-      user: {
-        id: user._id.toString(),
-        email: user.email,
-        username: user.username
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
+        const { data, error } = await authSupabase.auth.signInWithPassword({
+            email,
+            password
+        });
+
+        if (error || !data.user || !data.session) {
+            res.status(401).json({ message: error?.message || 'Invalid credentials' } as any);
+            return;
+        }
+
+        const profile = await pool.query(
+            'SELECT username FROM profiles WHERE id = $1 LIMIT 1',
+            [data.user.id]
+        );
+
+        const username = profile.rows[0]?.username || (data.user.user_metadata as any)?.username || '';
+
+        await saveProfile(data.user.id, data.user.email || email, username);
+        setAuthCookies(res, data.session.access_token, data.session.refresh_token);
+
+        res.json({
+            token: data.session.access_token,
+            refreshToken: data.session.refresh_token,
+            user: {
+                id: data.user.id,
+                email: data.user.email || email,
+                username
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ message: error.message } as any);
+    }
+});
+
+router.get('/oauth/:provider', async (req: Request, res: Response): Promise<void> => {
+    try {
+        const provider = req.params.provider as 'google' | 'github' | 'facebook' | 'apple' | 'discord';
+        const redirectTo = (req.query.redirectTo as string) || process.env.OAUTH_REDIRECT_TO || process.env.FRONTEND_URL || '';
+
+        const { data, error } = await authSupabase.auth.signInWithOAuth({
+            provider,
+            options: {
+                redirectTo: redirectTo || undefined
+            }
+        });
+
+        if (error || !data.url) {
+            res.status(400).json({ message: error?.message || 'Failed to create OAuth URL' });
+            return;
+        }
+
+        res.json({ url: data.url } as any);
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+router.post('/logout', (req: Request, res: Response): void => {
+    res.clearCookie('authToken', cookieOptions);
+    res.clearCookie('refreshToken', cookieOptions);
+    res.clearCookie('isLoggedIn', publicCookieOptions);
+    res.json({ message: 'Logged out successfully' });
+});
+
+router.get('/me', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+        if (!req.user) {
+            res.status(401).json({ message: 'Unauthorized' });
+            return;
+        }
+
+        const profile = await pool.query(
+            'SELECT username FROM profiles WHERE id = $1 LIMIT 1',
+            [req.user.id]
+        );
+
+        res.json({
+            user: {
+                id: req.user.id,
+                email: req.user.email || '',
+                username: profile.rows[0]?.username || req.user.username || ''
+            }
+        } as any);
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
 });
 
 export default router;

@@ -1,444 +1,530 @@
-import express, { Request, Response } from 'express';
-import Transaction from '../models/Transaction';
-import Budget from '../models/Budget';
+import express, { Response } from 'express';
+import { pool } from '../config/postgres';
 import { authenticateToken } from '../middleware/auth';
-import { DashboardStats } from '../types';
-import { AuthRequest } from '../types';
+import { AuthRequest, DashboardStats } from '../types';
+
 const router = express.Router();
 
-// interface AuthRequest extends Request {
-//   user?: any;
-// }
+type TransactionType = 'expense' | 'income';
 
-// Get all Transactions for user
-router.get('/', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const transactions = await Transaction.find({ userId: req.user.userId })
-      .sort({ date: -1 })
-      .limit(100);
-    
-    res.json(transactions);
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
-});
+interface TransactionRow {
+    id: number;
+    owner_user_id: string;
+    from_user_id: string;
+    to_user_id: string | null;
+    second_party_id: string | null;
+    amount: string | number;
+    transaction_type: TransactionType;
+    mode: string;
+    source: string;
+    tags: string[] | null;
+    category: string | null;
+    notes: string | null;
+    created_at: string;
+    updated_at: string;
+}
 
-
-// Get paginated Transactions with filters
-router.get('/transactions', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const { 
-      page = 1, 
-      limit = 10, 
-      startDate, 
-      endDate 
-    } = req.query;
-
-    const pageNum = parseInt(page as string);
-    const limitNum = parseInt(limit as string);
-    const skip = (pageNum - 1) * limitNum;
-
-    // Build date filter
-    let dateFilter: any = {};
-    if (startDate && endDate) {
-      dateFilter = {
-        date: {
-          $gte: new Date(startDate as string),
-          $lte: new Date(new Date(endDate as string).setHours(23, 59, 59, 999))
-        }
-      };
-    } else if (startDate) {
-      dateFilter = {
-        date: { $gte: new Date(startDate as string) }
-      };
-    } else if (endDate) {
-      dateFilter = {
-        date: { $lte: new Date(new Date(endDate as string).setHours(23, 59, 59, 999)) }
-      };
+const normalizeTags = (value: unknown): string[] => {
+    if (!value) {
+        return [];
     }
 
-    // Build query
-    const query = {
-      userId: req.user.userId,
-      ...dateFilter
-    };
+    if (Array.isArray(value)) {
+        return value
+            .map((tag) => String(tag).trim())
+            .filter(Boolean);
+    }
 
-    // Get total count for pagination
-    const total = await Transaction.countDocuments(query);
+    return String(value)
+        .split(',')
+        .map((tag) => tag.trim())
+        .filter(Boolean);
+};
 
-    // Get Transactions with pagination
-    const transactions = await Transaction.find(query)
-      .sort({ date: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limitNum);
-
-    res.json({
-      transactions,
-      pagination: {
-        currentPage: pageNum,
-        totalPages: Math.ceil(total / limitNum),
-        totalItems: total,
-        itemsPerPage: limitNum,
-        hasNext: pageNum < Math.ceil(total / limitNum),
-        hasPrev: pageNum > 1
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
+const mapTransaction = (row: TransactionRow) => ({
+    id: row.id,
+    userId: row.owner_user_id,
+    from: row.from_user_id,
+    to: row.to_user_id,
+    fromUserId: row.from_user_id,
+    toUserId: row.to_user_id,
+    secondPartyId: row.second_party_id,
+    amount: Number(row.amount),
+    type: row.transaction_type,
+    mode: row.mode,
+    source: row.source,
+    category: row.category,
+    notes: row.notes,
+    tags: row.tags || [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    date: row.created_at
 });
 
+const loadTransactions = async ({
+    userId,
+    tags,
+    match = 'any',
+    startDate,
+    endDate,
+    page = 1,
+    limit = 100
+}: {
+    userId: string;
+    tags?: string[];
+    match?: 'any' | 'all';
+    startDate?: string;
+    endDate?: string;
+    page?: number;
+    limit?: number;
+}) => {
+    const conditions = ['owner_user_id = $1'];
+    const values: Array<string | number | string[]> = [userId];
+    let placeholderIndex = 2;
+
+    if (startDate) {
+        conditions.push(`created_at >= $${placeholderIndex}`);
+        values.push(startDate);
+        placeholderIndex += 1;
+    }
+
+    if (endDate) {
+        conditions.push(`created_at <= $${placeholderIndex}`);
+        values.push(endDate);
+        placeholderIndex += 1;
+    }
+
+    if (tags && tags.length > 0) {
+        conditions.push(`tags ${match === 'all' ? '@>' : '&&'} $${placeholderIndex}::text[]`);
+        values.push(tags);
+        placeholderIndex += 1;
+    }
+
+    const whereClause = conditions.join(' AND ');
+    const countResult = await pool.query(`SELECT COUNT(*)::int AS total FROM transactions WHERE ${whereClause}`, values);
+
+    const offset = (page - 1) * limit;
+    const listValues = [...values, limit, offset];
+    const transactionsResult = await pool.query<TransactionRow>(
+        `
+      SELECT *
+      FROM transactions
+      WHERE ${whereClause}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${placeholderIndex} OFFSET $${placeholderIndex + 1}
+    `,
+        listValues
+    );
+
+    return {
+        total: countResult.rows[0]?.total || 0,
+        transactions: transactionsResult.rows.map(mapTransaction)
+    };
+};
+
+const parseDateTime = (value?: string, endOfDay = false): string | undefined => {
+    if (!value) {
+        return undefined;
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return undefined;
+    }
+
+    if (endOfDay) {
+        date.setHours(23, 59, 59, 999);
+    }
+
+    return date.toISOString();
+};
+
+const upsertBudgetSpend = async (userId: string, category: string, amount: number, transactionDate: string): Promise<void> => {
+    const month = transactionDate.slice(0, 7);
+    const year = new Date(transactionDate).getFullYear();
+
+    await pool.query(
+        `
+      INSERT INTO budgets (user_id, category, limit_amount, current_spent, month, year)
+      VALUES ($1, $2, 0, $3, $4, $5)
+      ON CONFLICT (user_id, category, month)
+      DO UPDATE SET
+        current_spent = budgets.current_spent + EXCLUDED.current_spent,
+        year = EXCLUDED.year,
+        updated_at = CURRENT_TIMESTAMP
+    `,
+        [userId, category, amount, month, year]
+    );
+};
+
+// Get all transactions for current user
+router.get('/', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+        const result = await loadTransactions({ userId: req.user!.id, limit: 100 });
+        res.json(result.transactions);
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+// Compatibility endpoint for paginated listing and date filtering
+router.get('/transactions', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+        const page = parseInt((req.query.page as string) || '1', 10);
+        const limit = parseInt((req.query.limit as string) || '10', 10);
+        const startDate = parseDateTime(req.query.startDate as string);
+        const endDate = parseDateTime(req.query.endDate as string, true);
+
+        const result = await loadTransactions({
+            userId: req.user!.id,
+            startDate,
+            endDate,
+            page,
+            limit
+        });
+
+        res.json({
+            transactions: result.transactions,
+            pagination: {
+                currentPage: page,
+                totalPages: Math.ceil(result.total / limit),
+                totalItems: result.total,
+                itemsPerPage: limit,
+                hasNext: page < Math.ceil(result.total / limit),
+                hasPrev: page > 1
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+// Filter transactions by tags
+router.get('/filter/tags', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+        const tags = normalizeTags(req.query.tags);
+        const match = req.query.match === 'all' ? 'all' : 'any';
+
+        const result = await loadTransactions({
+            userId: req.user!.id,
+            tags,
+            match,
+            page: 1,
+            limit: 500
+        });
+
+        res.json({
+            tags,
+            match,
+            transactions: result.transactions
+        });
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
+});
 
 // Create transaction
 router.post('/', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  // console.log('Creating transaction:', req);
-  try {
-    const transactionData = {
-      ...req.body,
-      userId: req.user.userId
-    };
-    // console.log('Transaction data:', transactionData);
-    const transaction = new Transaction(transactionData);
-    // console.log('New transaction:', transaction);
-    await transaction.save();
-    // console.log('Transaction saved:', transaction);
+    try {
+        const {
+            amount,
+            type,
+            mode,
+            source,
+            tags = [],
+            secondPartyId,
+            category,
+            notes,
+            createdAt
+        } = req.body;
 
-    // Update budget currentSpent
-    const month = new Date(transaction.date).toISOString().slice(0, 7); // "2024-01"
-    const year = new Date(transaction.date).getFullYear();
+        if (amount === undefined || amount === null || !type || !mode || !source) {
+            res.status(400).json({ message: 'amount, type, mode, and source are required' });
+            return;
+        }
 
-    await Budget.findOneAndUpdate(
-      { 
-        userId: req.user.userId, 
-        category: transaction.category, 
-        month: month 
-      },
-      { 
-        $inc: { currentSpent: transaction.amount },
-        year: year
-      },
-      { upsert: true }
-    );
+        if (type !== 'expense' && type !== 'income') {
+            res.status(400).json({ message: 'type must be expense or income' });
+            return;
+        }
 
-    res.status(201).json(transaction);
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
+        const normalizedTags = normalizeTags(tags);
+        const transactionDate = createdAt ? new Date(createdAt) : new Date();
+
+        if (Number.isNaN(transactionDate.getTime())) {
+            res.status(400).json({ message: 'createdAt must be a valid date' });
+            return;
+        }
+
+        const userId = req.user!.id;
+        const counterpartyId = secondPartyId ? String(secondPartyId) : null;
+
+        if (!counterpartyId) {
+            res.status(400).json({ message: 'secondPartyId is required to map the complement transaction' });
+            return;
+        }
+
+        const fromUserId = type === 'expense' ? userId : counterpartyId;
+        const toUserId = type === 'expense' ? counterpartyId : userId;
+
+        const result = await pool.query<TransactionRow>(
+            `
+        INSERT INTO transactions (
+          owner_user_id,
+          from_user_id,
+          to_user_id,
+          second_party_id,
+          amount,
+          transaction_type,
+          mode,
+          source,
+          tags,
+          category,
+          notes,
+          created_at,
+          updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text[], $10, $11, $12, CURRENT_TIMESTAMP)
+        RETURNING *
+      `,
+            [
+                userId,
+                fromUserId,
+                toUserId,
+                counterpartyId,
+                amount,
+                type,
+                mode,
+                source,
+                normalizedTags,
+                category || null,
+                notes || null,
+                transactionDate.toISOString()
+            ]
+        );
+
+        const transaction = mapTransaction(result.rows[0]);
+
+        if (type === 'expense' && category) {
+            await upsertBudgetSpend(userId, category, Number(amount), transactionDate.toISOString());
+        }
+
+        res.status(201).json(transaction);
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
+    }
 });
 
-// Update Transaction
+// Update transaction
 router.put('/:id', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const transaction = await Transaction.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.userId },
-      req.body,
-      { new: true }
-    );
+    try {
+        const existing = await pool.query<TransactionRow>(
+            'SELECT * FROM transactions WHERE id = $1 AND owner_user_id = $2 LIMIT 1',
+            [req.params.id, req.user!.id]
+        );
 
-    if (!transaction) {
-      res.status(404).json({ message: 'Transaction not found' });
-      return;
+        if (!existing.rows[0]) {
+            res.status(404).json({ message: 'Transaction not found' });
+            return;
+        }
+
+        const current = existing.rows[0];
+        const nextType: TransactionType = req.body.type || current.transaction_type;
+        const nextSecondPartyId = req.body.secondPartyId ? String(req.body.secondPartyId) : current.second_party_id;
+        const nextTags = req.body.tags !== undefined ? normalizeTags(req.body.tags) : current.tags || [];
+        const nextCreatedAt = req.body.createdAt ? new Date(req.body.createdAt) : new Date(current.created_at);
+
+        if (Number.isNaN(nextCreatedAt.getTime())) {
+            res.status(400).json({ message: 'createdAt must be a valid date' });
+            return;
+        }
+
+        const nextFromUserId = nextType === 'expense' ? req.user!.id : nextSecondPartyId;
+        const nextToUserId = nextType === 'expense' ? nextSecondPartyId : req.user!.id;
+
+        const updated = await pool.query<TransactionRow>(
+            `
+        UPDATE transactions
+        SET
+          amount = COALESCE($1, amount),
+          transaction_type = COALESCE($2, transaction_type),
+          mode = COALESCE($3, mode),
+          source = COALESCE($4, source),
+          tags = COALESCE($5::text[], tags),
+          category = COALESCE($6, category),
+          notes = COALESCE($7, notes),
+          from_user_id = $8,
+          to_user_id = $9,
+          second_party_id = $10,
+          created_at = $11,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $12 AND owner_user_id = $13
+        RETURNING *
+      `,
+            [
+                req.body.amount ?? null,
+                req.body.type ?? null,
+                req.body.mode ?? null,
+                req.body.source ?? null,
+                req.body.tags !== undefined ? nextTags : null,
+                req.body.category ?? null,
+                req.body.notes ?? null,
+                nextFromUserId,
+                nextToUserId,
+                nextSecondPartyId,
+                nextCreatedAt.toISOString(),
+                req.params.id,
+                req.user!.id
+            ]
+        );
+
+        if (!updated.rows[0]) {
+            res.status(404).json({ message: 'Transaction not found' });
+            return;
+        }
+
+        res.json(mapTransaction(updated.rows[0]));
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
     }
-
-    res.json(transaction);
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
 });
 
 // Delete transaction
 router.delete('/:id', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const transaction = await Transaction.findOneAndDelete({
-      _id: req.params.id,
-      userId: req.user.userId
-    });
+    try {
+        const deleted = await pool.query(
+            'DELETE FROM transactions WHERE id = $1 AND owner_user_id = $2 RETURNING id',
+            [req.params.id, req.user!.id]
+        );
 
-    if (!transaction) {
-      res.status(404).json({ message: 'Transaction not found' });
-      return;
-    }
-
-    res.json({ message: 'Transaction deleted successfully' });
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-
-
-// Get paginated Transactions with filters
-router.get('/transactions', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const { 
-      page = 1, 
-      limit = 10, 
-      startDate, 
-      endDate 
-    } = req.query;
-
-    const pageNum = parseInt(page as string);
-    const limitNum = parseInt(limit as string);
-    const skip = (pageNum - 1) * limitNum;
-
-    // Build date filter
-    let dateFilter: any = {};
-    if (startDate && endDate) {
-      dateFilter = {
-        date: {
-          $gte: new Date(startDate as string),
-          $lte: new Date(new Date(endDate as string).setHours(23, 59, 59, 999))
+        if (!deleted.rows[0]) {
+            res.status(404).json({ message: 'Transaction not found' });
+            return;
         }
-      };
-    } else if (startDate) {
-      dateFilter = {
-        date: { $gte: new Date(startDate as string) }
-      };
-    } else if (endDate) {
-      dateFilter = {
-        date: { $lte: new Date(new Date(endDate as string).setHours(23, 59, 59, 999)) }
-      };
+
+        res.json({ message: 'Transaction deleted successfully' });
+    } catch (error: any) {
+        res.status(500).json({ message: error.message });
     }
-
-    // Build query
-    const query = {
-      userId: req.user.userId,
-      ...dateFilter
-    };
-
-    // Get total count for pagination
-    const total = await Transaction.countDocuments(query);
-
-    // Get Transactions with pagination
-    const transactions = await Transaction.find(query)
-      .sort({ date: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limitNum);
-
-    res.json({
-      transactions,
-      pagination: {
-        currentPage: pageNum,
-        totalPages: Math.ceil(total / limitNum),
-        totalItems: total,
-        itemsPerPage: limitNum,
-        hasNext: pageNum < Math.ceil(total / limitNum),
-        hasPrev: pageNum > 1
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ message: error.message });
-  }
 });
-
-
-
-
-// // Dashboard data
-// router.get('/dashboard', authenticateToken, async (req: AuthRequest, res: Response<DashboardStats>): Promise<void> => {
-//   try {
-//     const currentMonth = new Date().toISOString().slice(0, 7);
-    
-//     // Get current month Transactions
-//     const transactions = await Transaction.find({
-//       userId: req.user.userId,
-//       date: {
-//         $gte: new Date(currentMonth + '-01'),
-//         $lte: new Date(new Date(currentMonth + '-01').getFullYear(), new Date(currentMonth + '-01').getMonth() + 1, 0)
-//       }
-//     });
-
-//     // Calculate stats
-//     // TODO : only pick those with expense type
-//     const totalSpent = transactions.reduce((sum, transaction) => sum + transaction.amount, 0);
-
-//     const categoryTotals: { [key: string]: number } = {};
-//     const paymentMethodCounts: { [key: string]: number } = {};
-
-//     transactions.forEach(transaction => {
-//       categoryTotals[transaction.category] = (categoryTotals[transaction.category] || 0) + transaction.amount;
-//       paymentMethodCounts[transaction.paymentMethod] = (paymentMethodCounts[transaction.paymentMethod] || 0) + 1;
-//     });
-
-//     const topCategory = Object.keys(categoryTotals).reduce((a, b) => 
-//       categoryTotals[a] > categoryTotals[b] ? a : b, ''
-//     );
-
-//     const topPaymentMethods = Object.keys(paymentMethodCounts)
-//       .sort((a, b) => paymentMethodCounts[b] - paymentMethodCounts[a]);
-
-//     // Get last 6 months data
-//     const monthlyData = [];
-//     for (let i = 5; i >= 0; i--) {
-//       const date = new Date();
-//       date.setMonth(date.getMonth() - i);
-//       const monthStr = date.toISOString().slice(0, 7);
-      
-//       const monthTransactions = await Transaction.find({
-//         userId: req.user.userId,
-//         date: {
-//           $gte: new Date(monthStr + '-01'),
-//           $lte: new Date(date.getFullYear(), date.getMonth() + 1, 0)
-//         }
-//       });
-
-//       monthlyData.push({
-//         month: date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
-//         amount: monthTransactions.reduce((sum, Transaction) => sum + Transaction.amount, 0)
-//       });
-//     }
-
-//     res.json({
-//       totalSpent,
-//       topCategory,
-//       topPaymentMethods,
-//       categoryData: categoryTotals,
-//       monthlyData
-//     });
-//   } catch (error: any) {
-//     res.status(500).json({ message: error.message } as any);
-//   }
-// });
 
 // Dashboard data
 router.get('/dashboard', authenticateToken, async (req: AuthRequest, res: Response<DashboardStats>): Promise<void> => {
-  try {
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    const startOfMonth = new Date(currentMonth + '-01');
-    const endOfMonth = new Date(startOfMonth.getFullYear(), startOfMonth.getMonth() + 1, 0);
-    
-    // Get current month transactions
-    const currentMonthTransactions = await Transaction.find({
-      userId: req.user.userId,
-      date: {
-        $gte: startOfMonth,
-        $lte: endOfMonth
-      }
-    });
+    try {
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        const monthStart = new Date(`${currentMonth}-01T00:00:00.000Z`);
+        const monthEnd = new Date(new Date(monthStart).getFullYear(), monthStart.getMonth() + 1, 0, 23, 59, 59, 999);
 
-    // Separate income and expenses
-    const expenses = currentMonthTransactions.filter(t => t.type === 'expense' || !t.type); // fallback for old data without type
-    const income = currentMonthTransactions.filter(t => t.type === 'income');
+        const { transactions } = await loadTransactions({
+            userId: req.user!.id,
+            startDate: monthStart.toISOString(),
+            endDate: monthEnd.toISOString(),
+            page: 1,
+            limit: 1000
+        });
 
-    // Calculate stats
-    const totalSpent = expenses.reduce((sum, expense) => sum + expense.amount, 0);
-    const totalIncome = income.reduce((sum, inc) => sum + inc.amount, 0);
-    const netAmount = totalIncome - totalSpent;
+        const expenses = transactions.filter((transaction) => transaction.type === 'expense');
+        const income = transactions.filter((transaction) => transaction.type === 'income');
 
-    // Category analysis (separate for income and expenses)
-    const expenseCategoryTotals: { [key: string]: number } = {};
-    const incomeCategoryTotals: { [key: string]: number } = {};
-    const paymentMethodCounts: { [key: string]: number } = {};
+        const totalSpent = expenses.reduce((sum, transaction) => sum + transaction.amount, 0);
+        const totalIncome = income.reduce((sum, transaction) => sum + transaction.amount, 0);
+        const netAmount = totalIncome - totalSpent;
 
-    expenses.forEach(expense => {
-      expenseCategoryTotals[expense.category] = (expenseCategoryTotals[expense.category] || 0) + expense.amount;
-      paymentMethodCounts[expense.paymentMethod] = (paymentMethodCounts[expense.paymentMethod] || 0) + 1;
-    });
+        const expenseCategoryTotals: Record<string, number> = {};
+        const incomeCategoryTotals: Record<string, number> = {};
+        const paymentMethodCounts: Record<string, number> = {};
 
-    income.forEach(inc => {
-      incomeCategoryTotals[inc.category] = (incomeCategoryTotals[inc.category] || 0) + inc.amount;
-      paymentMethodCounts[inc.paymentMethod] = (paymentMethodCounts[inc.paymentMethod] || 0) + 1;
-    });
+        expenses.forEach((transaction) => {
+            if (transaction.category) {
+                expenseCategoryTotals[transaction.category] = (expenseCategoryTotals[transaction.category] || 0) + transaction.amount;
+            }
+            paymentMethodCounts[transaction.mode] = (paymentMethodCounts[transaction.mode] || 0) + 1;
+        });
 
-    // Find top categories
-    const topExpenseCategory = Object.keys(expenseCategoryTotals).length > 0 
-      ? Object.keys(expenseCategoryTotals).reduce((a, b) => 
-          expenseCategoryTotals[a] > expenseCategoryTotals[b] ? a : b
-        ) 
-      : '';
+        income.forEach((transaction) => {
+            if (transaction.category) {
+                incomeCategoryTotals[transaction.category] = (incomeCategoryTotals[transaction.category] || 0) + transaction.amount;
+            }
+            paymentMethodCounts[transaction.mode] = (paymentMethodCounts[transaction.mode] || 0) + 1;
+        });
 
-    const topIncomeCategory = Object.keys(incomeCategoryTotals).length > 0
-      ? Object.keys(incomeCategoryTotals).reduce((a, b) => 
-          incomeCategoryTotals[a] > incomeCategoryTotals[b] ? a : b
-        )
-      : '';
+        const topExpenseCategory = Object.keys(expenseCategoryTotals).length > 0
+            ? Object.keys(expenseCategoryTotals).reduce((a, b) => (expenseCategoryTotals[a] > expenseCategoryTotals[b] ? a : b))
+            : '';
 
-    // Top payment methods sorted by usage
-    const topPaymentMethods = Object.keys(paymentMethodCounts)
-      .sort((a, b) => paymentMethodCounts[b] - paymentMethodCounts[a])
-      .slice(0, 5); // Get top 5 payment methods
+        const topIncomeCategory = Object.keys(incomeCategoryTotals).length > 0
+            ? Object.keys(incomeCategoryTotals).reduce((a, b) => (incomeCategoryTotals[a] > incomeCategoryTotals[b] ? a : b))
+            : '';
 
-    // Get last 6 months data with income/expense breakdown
-    const monthlyData = [];
-    for (let i = 5; i >= 0; i--) {
-      const date = new Date();
-      date.setMonth(date.getMonth() - i);
-      const monthStr = date.toISOString().slice(0, 7);
-      const monthStart = new Date(monthStr + '-01');
-      const monthEnd = new Date(date.getFullYear(), date.getMonth() + 1, 0);
-      
-      const monthTransactions = await Transaction.find({
-        userId: req.user.userId,
-        date: {
-          $gte: monthStart,
-          $lte: monthEnd
+        const topPaymentMethods = Object.keys(paymentMethodCounts)
+            .sort((a, b) => paymentMethodCounts[b] - paymentMethodCounts[a])
+            .slice(0, 5);
+
+        const monthlyData = [];
+        for (let i = 5; i >= 0; i -= 1) {
+            const date = new Date();
+            date.setMonth(date.getMonth() - i);
+            const monthStr = date.toISOString().slice(0, 7);
+            const monthStartDate = new Date(`${monthStr}-01T00:00:00.000Z`);
+            const monthEndDate = new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
+
+            const { transactions: monthTransactions } = await loadTransactions({
+                userId: req.user!.id,
+                startDate: monthStartDate.toISOString(),
+                endDate: monthEndDate.toISOString(),
+                page: 1,
+                limit: 1000
+            });
+
+            const monthExpenses = monthTransactions.filter((transaction) => transaction.type === 'expense');
+            const monthIncome = monthTransactions.filter((transaction) => transaction.type === 'income');
+
+            const expenseAmount = monthExpenses.reduce((sum, transaction) => sum + transaction.amount, 0);
+            const incomeAmount = monthIncome.reduce((sum, transaction) => sum + transaction.amount, 0);
+
+            monthlyData.push({
+                month: date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+                expenses: expenseAmount,
+                income: incomeAmount,
+                net: incomeAmount - expenseAmount,
+                amount: expenseAmount
+            });
         }
-      });
 
-      const monthExpenses = monthTransactions.filter(t => t.type === 'expense' || !t.type);
-      const monthIncome = monthTransactions.filter(t => t.type === 'income');
+        const transactionCounts = {
+            totalTransactions: transactions.length,
+            expenseCount: expenses.length,
+            incomeCount: income.length
+        };
 
-      const expenseAmount = monthExpenses.reduce((sum, expense) => sum + expense.amount, 0);
-      const incomeAmount = monthIncome.reduce((sum, income) => sum + income.amount, 0);
+        const averages = {
+            avgExpense: expenses.length > 0 ? totalSpent / expenses.length : 0,
+            avgIncome: income.length > 0 ? totalIncome / income.length : 0
+        };
 
-      monthlyData.push({
-        month: date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
-        expenses: expenseAmount,
-        income: incomeAmount,
-        net: incomeAmount - expenseAmount,
-        // Legacy field for backward compatibility
-        amount: expenseAmount
-      });
+        const savingsRate = totalIncome > 0 ? ((totalIncome - totalSpent) / totalIncome) * 100 : 0;
+
+        res.json({
+            totalSpent,
+            totalIncome,
+            netAmount,
+            savingsRate: Math.round(savingsRate * 100) / 100,
+            topExpenseCategory,
+            topIncomeCategory,
+            expenseCategoryData: expenseCategoryTotals,
+            incomeCategoryData: incomeCategoryTotals,
+            topPaymentMethods,
+            paymentMethodData: paymentMethodCounts,
+            monthlyData,
+            ...transactionCounts,
+            ...averages,
+            topCategory: topExpenseCategory,
+            categoryData: expenseCategoryTotals
+        });
+    } catch (error: any) {
+        console.error('Dashboard API Error:', error);
+        res.status(500).json({ message: error.message } as any);
     }
-
-    // Additional insights
-    const transactionCounts = {
-      totalTransactions: currentMonthTransactions.length,
-      expenseCount: expenses.length,
-      incomeCount: income.length
-    };
-
-    // Average transaction amounts
-    const averages = {
-      avgExpense: expenses.length > 0 ? totalSpent / expenses.length : 0,
-      avgIncome: income.length > 0 ? totalIncome / income.length : 0
-    };
-
-    // Savings rate (if there's income)
-    const savingsRate = totalIncome > 0 ? ((totalIncome - totalSpent) / totalIncome) * 100 : 0;
-
-    res.json({
-      // Current month summary
-      totalSpent,
-      totalIncome,
-      netAmount,
-      savingsRate: Math.round(savingsRate * 100) / 100, // Round to 2 decimal places
-      
-      // Category insights
-      topExpenseCategory,
-      topIncomeCategory,
-      expenseCategoryData: expenseCategoryTotals,
-      incomeCategoryData: incomeCategoryTotals,
-      
-      // Payment methods
-      topPaymentMethods,
-      paymentMethodData: paymentMethodCounts,
-      
-      // Historical data
-      monthlyData,
-      
-      // Transaction counts and averages
-      ...transactionCounts,
-      ...averages,
-      
-      // Legacy fields for backward compatibility
-      topCategory: topExpenseCategory,
-      categoryData: expenseCategoryTotals
-    });
-
-  } catch (error: any) {
-    console.error('Dashboard API Error:', error);
-    res.status(500).json({ message: error.message } as any);
-  }
 });
+
 export default router;

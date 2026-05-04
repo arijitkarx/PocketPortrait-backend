@@ -1,47 +1,11 @@
-import { Document, ObjectId } from 'mongoose';
 import { Request } from 'express';
 
-// MongoDB Interfaces
-export interface IUser extends Document {
-  _id: ObjectId;
-  email: string;
-  username: string;
-  password: string;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-
-export interface ITransaction extends Document {
-  _id: ObjectId;
-  userId: ObjectId;
-  amount: number;
-  from?: string;
-  to?: string;
-  date: Date;
-  paymentMethod: string;
-  createdAt: Date;
-  updatedAt: Date;
-  secondpartyId?: ObjectId;
-  category: string;
-  notes?: string;
-  type?: 'expense' | 'income';
-  tags?: string[];
-  recurring?: boolean;
-  frequency?: 'daily' | 'weekly' | 'monthly' | 'yearly';
-  secondpartyType?: 'individual' | 'business';
-}
-
-export interface IBudget extends Document {
-  _id: ObjectId;
-  userId: ObjectId;
-  category: string;
-  limitAmount: number;
-  currentSpent: number;
-  month: string;
-  year: number;
-  createdAt: Date;
-  updatedAt: Date;
+export interface AuthenticatedUser {
+  id: string;
+  email?: string;
+  username?: string;
+  user_metadata?: Record<string, any>;
+  app_metadata?: Record<string, any>;
 }
 
 // PostgreSQL Interfaces
@@ -77,6 +41,7 @@ export interface UserSummary {
 
 export interface AuthResponse {
   token: string;
+  refreshToken?: string;
   user: {
     id: string;
     email: string;
@@ -85,14 +50,7 @@ export interface AuthResponse {
 }
 
 export interface AuthRequest extends Request {
-    email: string;
-  username?: string;
-  password: string;
-  user?: any;
-  cookies: Record<string, any>;
-  body: any;
-  params: any;
-  query: any;
+  user?: AuthenticatedUser;
 }
 
 // export interface DashboardStats {
@@ -109,7 +67,7 @@ export interface DashboardStats {
   totalIncome: number;
   netAmount: number;
   savingsRate: number;
-  
+
   // Category Analysis
   topCategory: string; // Top expense category (for backward compatibility)
   topExpenseCategory: string;
@@ -117,20 +75,20 @@ export interface DashboardStats {
   categoryData: { [key: string]: number }; // Expense categories (for backward compatibility)
   expenseCategoryData: { [key: string]: number };
   incomeCategoryData: { [key: string]: number };
-  
+
   // Payment Methods
   topPaymentMethods: string[];
   paymentMethodData: { [key: string]: number };
-  
+
   // Historical Data
-  monthlyData: { 
-    month: string; 
+  monthlyData: {
+    month: string;
     amount: number; // Expense amount (for backward compatibility)
     expenses: number;
     income: number;
     net: number;
   }[];
-  
+
   // Transaction Insights
   totalTransactions: number;
   expenseCount: number;

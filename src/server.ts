@@ -1,9 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import connectMongoDB from './config/mongodb';
 import { initializeDatabase } from './config/postgres';
-import cookieParser from 'cookie-parser'; 
+import cookieParser from 'cookie-parser';
 
 // Routes
 import authRoutes from './routes/auth';
@@ -51,11 +50,8 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 // Start server
 const startServer = async (): Promise<void> => {
   try {
-    // Connect to databases
-    // console.log('somewhere we are here start server');
-    await connectMongoDB();
     await initializeDatabase();
-    
+
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📱 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
